@@ -10,6 +10,7 @@ type DataEnc = | FormEncode | JsonEncode | Plain
 type ProviderConfig = {
     authorize_uri: string;
     exchange_token_uri: string;
+    refresh_uri: string;
     client_id: string;
     client_secret: string
     request_info_uri: string
@@ -23,11 +24,11 @@ exception private OAuthException of string
 /// <summary>
 /// Result type for successive login callback.
 /// </summary>
-type LoginData = {ProviderName: string; Id: string; Name: string; AccessToken: string; ProviderData: Map<string,obj>}
+type LoginData = {ProviderName: string; Id: string; Name: string; Email:string; AccessToken: string; RefreshToken:string; ProviderData: Map<string,obj>}
 type FailureData = {Code: int; Message: string; Info: obj}
 
 let EmptyConfig =
-    {authorize_uri = ""; exchange_token_uri = ""; request_info_uri = ""; client_id = ""; client_secret = "";
+    {authorize_uri = ""; exchange_token_uri = ""; request_info_uri = ""; refresh_uri=""; client_id = ""; client_secret = "";
     scopes = ""; token_response_type = FormEncode; customize_req = ignore}
 
 /// <summary>
@@ -37,9 +38,10 @@ let private providerConfigs =
     Map.empty
     |> Map.add "google"
         {EmptyConfig with
-            authorize_uri = "https://accounts.google.com/o/oauth2/auth"
+            authorize_uri = "https://accounts.google.com/o/oauth2/v2/auth"
             exchange_token_uri = "https://www.googleapis.com/oauth2/v3/token"
             request_info_uri = "https://www.googleapis.com/oauth2/v1/userinfo"
+            refresh_uri="https://www.googleapis.com/oauth2/v4/token"
             scopes = "profile"
             token_response_type = JsonEncode
             }
@@ -48,12 +50,14 @@ let private providerConfigs =
             authorize_uri = "https://github.com/login/oauth/authorize"
             exchange_token_uri = "https://github.com/login/oauth/access_token"
             request_info_uri = "https://api.github.com/user"
+            refresh_uri=""
             scopes = ""}
     |> Map.add "facebook"
         {EmptyConfig with
             authorize_uri = "https://www.facebook.com/dialog/oauth"
             exchange_token_uri = "https://graph.facebook.com/oauth/access_token"
             request_info_uri = "https://graph.facebook.com/me"
+            refresh_uri=""
             scopes = ""}
 
 /// <summary>
@@ -81,6 +85,7 @@ module internal util =
         jss.DeserializeObject(js) :?> seq<_> |> Seq.map (|KeyValue|) |> Map.ofSeq
 
 module private impl =
+    open Suave
 
     let getConfig ctx (configs: Map<string,ProviderConfig>) =
 
@@ -93,19 +98,17 @@ module private impl =
         | None -> raise (OAuthException "bad provider key in query")
         | Some c -> provider_key, c
 
+    let extractToken tokenType (config: ProviderConfig)=
+        match config.token_response_type with
+        | JsonEncode -> util.parseJsObj >> Map.tryFind tokenType >> Option.bind (unbox<string> >> Some)
+        | FormEncode -> util.formDecode >> Map.tryFind tokenType >> Option.bind (unbox<string> >> Some)
+        | Plain ->      Some
 
-    let login (configs: Map<string,ProviderConfig>) redirectUri (fnSuccess: LoginData -> WebPart) : WebPart =
-
+    let login (configs: Map<string,ProviderConfig>) redirectUri (fnSuccess: LoginData -> WebPart): WebPart =
         // TODO use Uri to properly add parameter to redirectUri
-
         (fun ctx ->
             let provider_key,config = configs |> getConfig ctx
 
-            let extractToken =
-                match config.token_response_type with
-                | JsonEncode -> util.parseJsObj >> Map.tryFind "access_token" >> Option.bind (unbox<string> >> Some)
-                | FormEncode -> util.formDecode >> Map.tryFind "access_token" >> Option.bind (unbox<string> >> Some)
-                | Plain ->      Some
             ctx.request.queryParam "code" |> printfn "param code: %A" // TODO log
 
             match ctx.request.queryParam "code" with
@@ -113,20 +116,76 @@ module private impl =
                 raise (OAuthException "server did not return access code")
             | Choice1Of2 code ->
 
-                let parms = [
-                    "code", code
-                    "client_id", config.client_id
-                    "client_secret", config.client_secret
-                    "redirect_uri", redirectUri + "?provider=" + provider_key
-                    "grant_type", "authorization_code"
-                ]
+                let parms =
+                        [
+                            "code", code
+                            "client_id", config.client_id
+                            "client_secret", config.client_secret
+                            "redirect_uri", redirectUri + "?provider=" + provider_key
+                            "grant_type", "authorization_code"
+                        ]
 
                 async {
                     let! response = parms |> util.formEncode |> util.asciiEncode |> HttpCli.post config.exchange_token_uri config.customize_req
                     response |> printfn "Auth response is %A"        // TODO log
 
-                    let access_token = response |> extractToken
+                    let access_token = response |> extractToken "access_token" config
+                    if Option.isNone access_token then
+                        raise (OAuthException "failed to extract access token")
 
+                    let refresh_token=response |> extractToken "refresh_token" config
+                    if Option.isNone refresh_token then
+                       raise (OAuthException "failed to extract access token")
+  
+                    let uri = config.request_info_uri + "?" + (["access_token", Option.get access_token] |> util.formEncode)
+                    let! response = HttpCli.get uri config.customize_req
+                    response |> printfn "/user response %A"        // TODO log
+
+                    let mutable user_info:Map<string,obj> = response |> util.parseJsObj
+                    
+                    //save guid so that is able later to corelate client who requested access_token
+                    let state=
+                        match ctx.request.queryParam "state" with
+                        | Choice1Of2 s -> s
+                        | _ -> ""
+                    user_info <- user_info.Add("state",state)  
+                    
+                    
+                    user_info |> printfn "/user_info response %A"  // TODO log
+
+                    let user_id = user_info.["id"] |> System.Convert.ToString
+                    let user_name = user_info.["name"] |> System.Convert.ToString
+                    let user_email = user_info.["email"] |> System.Convert.ToString
+
+                    return! fnSuccess
+                        { ProviderName = provider_key;
+                          Id = user_id; Name = user_name; AccessToken = Option.get access_token; RefreshToken=Option.get refresh_token;
+                          Email=user_email; ProviderData = user_info} ctx
+                }
+        )
+
+    let refresh (configs: Map<string,ProviderConfig>) (fnSuccess: LoginData -> WebPart) (fnFailure: FailureData -> WebPart) refresh_token : WebPart =
+        (fun ctx ->
+            async {
+            try
+                match refresh_token with
+                | Choice2Of2 _ -> return! fnFailure {FailureData.Code = 1; Message = "No refresh_token provided!"; Info = "Error"} ctx
+                | Choice1Of2 refresh_token when refresh_token="" -> return! fnFailure {FailureData.Code = 1; Message = "No refresh_token provided!"; Info = "Error"} ctx
+                | Choice1Of2 refresh_token ->
+                    let provider_key,config = configs |> getConfig ctx
+
+                    let parms=
+                            [
+                                "client_id", config.client_id
+                                "client_secret", config.client_secret
+                                "grant_type", "refresh_token"
+                                "refresh_token", refresh_token
+                            ] 
+
+                    let! response = parms |> util.formEncode |> util.asciiEncode |> HttpCli.post config.refresh_uri config.customize_req
+                    response |> printfn "Auth response is %A"        // TODO log
+
+                    let access_token = response |> extractToken "access_token" config
                     if Option.isNone access_token then
                         raise (OAuthException "failed to extract access token")
 
@@ -134,17 +193,20 @@ module private impl =
                     let! response = HttpCli.get uri config.customize_req
                     response |> printfn "/user response %A"        // TODO log
 
-                    let user_info:Map<string,obj> = response |> util.parseJsObj
+                    let mutable user_info:Map<string,obj> = response |> util.parseJsObj
+            
                     user_info |> printfn "/user_info response %A"  // TODO log
 
                     let user_id = user_info.["id"] |> System.Convert.ToString
                     let user_name = user_info.["name"] |> System.Convert.ToString
+                    let user_email = user_info.["email"] |> System.Convert.ToString
 
                     return! fnSuccess
                         { ProviderName = provider_key;
-                          Id = user_id; Name = user_name; AccessToken = Option.get access_token;
-                          ProviderData = user_info} ctx
-                }
+                          Id = user_id; Name = user_name; AccessToken = Option.get access_token; RefreshToken=refresh_token;
+                          Email=user_email; ProviderData = user_info} ctx
+            with e -> return! fnFailure {FailureData.Code = 1; Message = e.Message; Info = e} ctx
+            }
         )
 
 /// <summary>
@@ -152,16 +214,19 @@ module private impl =
 /// </summary>
 /// <param name="configs"></param>
 /// <param name="redirectUri"></param>
-let redirectAuthQuery (configs:Map<string,ProviderConfig>) redirectUri : WebPart =
+let redirectAuthQuery (configs:Map<string,ProviderConfig>) redirectUri state : WebPart =
     warbler (fun ctx ->
 
         let provider_key,config = configs |> impl.getConfig ctx
 
         let parms = [
+            "scope", config.scopes
+            "access_type", "offline"
+            "client_id", config.client_id
             "redirect_uri", redirectUri + "?provider=" + provider_key
             "response_type", "code"
-            "client_id", config.client_id
-            "scope", config.scopes
+            "prompt", "consent"
+            "state", state  //Rizz8   
             ]
 
         let q = config.authorize_uri + "?" + (parms |> util.formEncode)
@@ -176,11 +241,14 @@ let redirectAuthQuery (configs:Map<string,ProviderConfig>) redirectUri : WebPart
 /// <param name="redirectUri"></param>
 /// <param name="f_success"></param>
 /// <param name="f_failure"></param>
-let processLogin (configs: Map<string,ProviderConfig>) redirectUri (fnSuccess: LoginData -> WebPart) (fnFailure: FailureData -> WebPart) : WebPart =
-
+let processLogin (configs: Map<string,ProviderConfig>) redirectUri (fnSuccess: LoginData -> WebPart) 
+    (fnFailure: FailureData -> WebPart): WebPart =
     fun ctx ->
         async {
-            try return! impl.login configs redirectUri fnSuccess ctx
+            try
+                let! res=impl.login configs redirectUri fnSuccess ctx 
+                return res
+            //try return! impl.login configs redirectUri fnSuccess ctx 
             with
                 | OAuthException e -> return! fnFailure {FailureData.Code = 1; Message = e; Info = e} ctx
                 | e -> return! fnFailure {FailureData.Code = 1; Message = e.Message; Info = e} ctx
@@ -196,7 +264,6 @@ let buildLoginUrl (ctx:HttpContext) =
     bb.Host <- ctx.request.host
     bb.Path <- "oalogin"
     bb.Query <- ""
-
     bb.ToString()
 
 /// <summary>
@@ -207,22 +274,26 @@ let buildLoginUrl (ctx:HttpContext) =
 /// <param name="fnLogin">Store login data and provide continuation webpart</param>
 /// <param name="fnLogout">Handle logout request and provide continuation webpart</param>
 /// <param name="fnFailure"></param>
-let authorize loginRedirectUri configs fnLogin fnLogout fnFailure =
+let authorize loginRedirectUri configs fnLogin fnLogout fnFailure (getState: HttpContext->string)=
     choose [
-        path "/oaquery" >=> GET >=> context(fun _ -> redirectAuthQuery configs loginRedirectUri)
-
+        path "/oaquery" >=> GET >=> context(fun ctx -> redirectAuthQuery configs loginRedirectUri (getState ctx))
         path "/logout" >=> GET >=> 
             context(fun _ ->
                 let cont = fnLogout()
                 unsetPair Authentication.SessionAuthCookie >=> unsetPair Suave.State.CookieStateStore.StateCookie >=> cont
             )
+        //Callback from Google (or other provider)
         path "/oalogin" >=> GET >=>
-            context(fun _ ->
+            context(fun ctx ->
                 processLogin configs loginRedirectUri
                     (fnLogin >> (fun wpb -> Authentication.authenticated Cookie.CookieLife.Session false >=> wpb))
                     fnFailure
                 )
-    ]
+        path "/oarefresh" >=> GET >=>  
+              context(fun ctx ->
+                           impl.refresh configs (fnLogin >> (fun wpb -> Authentication.authenticated Cookie.CookieLife.Session false >=> wpb)) 
+                               fnFailure (ctx.request.queryParam "refresh_token"))
+            ]
 
 /// <summary>
 /// Utility handler which verifies if current user is authenticated using session cookie.
